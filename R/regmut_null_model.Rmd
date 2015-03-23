@@ -5,46 +5,62 @@ date: "March 19-23, 2015"
 output: html_document
 ---
 
-First we should iterate through the _de novo_ mutations file and get those that apply to regulatory mutations (or rather, those that don't apply to protein coding mutations).
+To get the sequence context for each of the well-covered regulatory regions, we will use the Ensembl database. The sequence context for each regulatory region was generated using a python script that utilizes bioservices (see https://github.com/cokelaer/bioservices or 'pip install bioservices'), a python wrapper for many different web services and REST APIs.
+
+The python code is very straightforward and the results are saved as a tab-delimited file with chromosome, position, and corresponding sequence. See /denovo_regs/python/ensembl_data.py for details if needed.
+
+We will search through the _de novo_ mutations file and identify regulatory mutations in well-covered regions.
 
 ```{r load data}
-denovo_full <- read.table("de_novos.ddd_4k.noncoding_included.txt", sep="\t", header=TRUE )
-```
+denovo_full <- read.table("../data/de_novos.ddd_4k.noncoding_included.txt", sep="\t", header=TRUE )
+well_covered_regions <- read.table("../data/DDD_TRRs.annotated.highcov.sequence.txt", sep="\t", header=TRUE)
+all_gencode <- read.table("../data/all_gencode_genes_v19_+strand.txt", sep="\t", header=TRUE)
+ddg2p <- read.table("../data/DDG2P_freeze_with_gencode19_genomic_coordinates_20141118_fixed.txt", sep="\t", header=TRUE)
 
-```{r non_coding variants, echo=FALSE}
-denovo_noncoding = denovo_full[denovo_full$coding == "FALSE",]
-consequence = denovo_noncoding$consequence
-chrom = denovo_noncoding$chrom
-```
-
-We should quickly do some summary figures to see what the non-coding variants represent.
-
-Variant spread across chromosomes:
-
-```{r chromosome, echo=FALSE}
-barplot(table(chrom), col="cyan", xlab="Chromosome", ylab="# de novo variants in DDD 4k")
+#restricting gencode genes to ONLY protein-coding genes (removes pseudogenes, lincRNA, etc.)
+all_gencode <- all_gencode[all_gencode$gene_type == "protein_coding",]
+all_gencode$gene <- factor(all_gencode$gene)  # reset the factors (gene names)
 
 ```
 
-Variant 'consequence' given by highest VEP score:
+We will first assign each of the well-covered annotated regulatory regions to the closest gencode gene (by transcription start site). Once each gene has been matched with a set of regulatory regions, we can use trinucleotide substitution rates to determine the probability of a _de novo_ mutation arising in any regulatory region associated with each gene.
 
-```{r consequence, echo=FALSE}
-par(mar=c(10,4,1,1) + 0.5)   # extra large bottom margin
-barplot(table(consequence)[table(consequence) != 0], cex.names=0.8, las=2, col="cyan", ylab="# de novo variants in DDD 4k")
+We closeness as distance upstream of a transcription start site, taking into account positive or negative strand as appropriate. For the annotated regulatory regions, we will use the start position of the interval.
+
+```{r gene proximity}
+# using distance to tx start site as rule for closeness strand +/- included
+# define a new variable 'true start' for each gencode gene based on strand
+
+all_gencode$true_start <- all_gencode$start
+all_gencode$true_start[all_gencode$strand == "-"] <- all_gencode$stop[all_gencode$strand == "-"]  # take any start sites that have "-" strand and swap to the stop site. will have to negate this later on.
+
+closest_gene <- function(chr, pos){
+  # get reduce search to only genes on correct chromosome
+  gencode_chrom = all_gencode[all_gencode$chr == paste("chr", chr, sep=""),] # paste to add chr
+  
+# find closest start site accounting for strand
+  distance_to_start = gencode_chrom$true_start - pos
+  distance_to_start[gencode_chrom$strand == "-"] = (-1)*distance_to_start[gencode_chrom$strand == "-"]
+
+  # take the min nonzero distance (this is the closest gene downstream of noncoding variant)
+  closest_start = which.min(sapply(distance_to_start, function(z) if (z > 0) z else Inf))
+  closest_gene = gencode_chrom[closest_start,]
+  return(closest_gene$gene)
+}
 
 ```
 
-Removing intronic variants for now (unlikely to be regulatory regions), but we will still match them against regulatory regions in the v3/v5 data.
+```{r assign regulatory regions}
+reg_region_closest_gene = factor(mapply(closest_gene, well_covered_regions$chr, well_covered_regions$start)) # returns a vector of gene names, one for each well-covered regulatory region
 
-```{r consequence intronic removed, echo=FALSE}
-barplot(table(consequence)[(table(consequence) != 0) & (levels(consequence) != "intron_variant")], cex.names=0.9, las=2, col="cyan", ylab="# de novo variants in DDD 4k")
+well_covered_regions$closest_gene = reg_region_closest_gene
 
 ```
 
-At this point we have all of the relevant data (most notably, the genomic location) for the _de novo_ regulatory mutations and need to load look-up table for mutation rate. We will construct this table from the data file as a vector.
+At this point we have a data frame called that has chromosome, start, stop, closest gene, and a few other annotations. Now we can load the mutation table based on 1000 genomes data.
 
 ```{r lookup table}
-mut_rates <- read.table("forSanger_1KG_mutation_rate_table.txt", header=TRUE)
+mut_rates <- read.table("../data/forSanger_1KG_mutation_rate_table.txt", header=TRUE)
 
 p_single <- function(from, to){
   p = mut_rates$mu_snp[c(mut_rates$from == from) & c(mut_rates$to == to)]
@@ -59,11 +75,12 @@ p_all <- function(from){
 
 We can use the functions `p_single(from, to)` to find the probability under the null model of mutation from a certain trinucleotide to another trinucleotide (changing the middle base). Likewise `p_all(from)` gives the probability of mutation from one trinucleotide to all three other possibilities.
 
-Given a stretch of sequence, we want to scan across with `p_all`, adding the (assumed independent) poisson lambda terms together to arrive at a total probability distribution for mutation anywhere along the stretch of sequence. The function `p_sequence` returns this probability.
+Given a stretch of sequence, we want to scan across with `p_all`, adding the (assumed independent) poisson lambda parameters together to arrive at a total probability distribution for mutation anywhere along the stretch of sequence. The function `p_sequence` defined below returns this probability.
 
 ```{r defining p_sequence}
 # may be able to do this better with rollapply, but looping for now
 p_sequence <- function(sequence){
+  sequence = as.character(sequence)
   p = 0
   for (i in 1:nchar(sequence)){
     p = p + p_all(substr(sequence, i, i+2))  }
@@ -71,6 +88,17 @@ p_sequence <- function(sequence){
   }
 
 ```
+
+We noticed 4 _de novo_ mutations near the DOCK7 gene. We can calculate the expected mutation rate over all of the regulatory regions close to DOCK7.
+
+```{r DOCK7 regulatory mutation background}
+DOCK7_reg = well_covered_regions[well_covered_regions$closest_gene == "DOCK7",]
+
+combined_lambda = sum(mapply(p_sequence, DOCK7_reg$seq))
+
+```
+
+There are `r nrow(DOCK7_reg)` regulatory regions associated with DOCK7 in our set. We calculate a lambda value for each of the sequences. This number represents the poisson expected _de novo_ mutation rate. As a sum of poisson distributions in poisson, we can simply sum over all of the sequences. The combined rate for DOCK7 is `r combined_lambda`.
 
 Given a sequence, we calculate the expected number of _de novo_ mutations and compare this to the observed number of _de novo_ mutations. Test for support or rejection of the null hypothesis uses the poisson exact test.
 
