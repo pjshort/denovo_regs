@@ -1,0 +1,99 @@
+---
+title: "Null Model for _De Novo_ Regulatory Mutations in DDD"
+author: "Patrick Short"
+date: "March 19-23, 2015"
+output: html_document
+---
+
+First we should iterate through the _de novo_ mutations file and get those that apply to regulatory mutations (or rather, those that don't apply to protein coding mutations).
+
+```{r load data}
+denovo_full <- read.table("de_novos.ddd_4k.noncoding_included.txt", sep="\t", header=TRUE )
+```
+
+```{r non_coding variants, echo=FALSE}
+denovo_noncoding = denovo_full[denovo_full$coding == "FALSE",]
+consequence = denovo_noncoding$consequence
+chrom = denovo_noncoding$chrom
+```
+
+We should quickly do some summary figures to see what the non-coding variants represent.
+
+Variant spread across chromosomes:
+
+```{r chromosome, echo=FALSE}
+barplot(table(chrom), col="cyan", xlab="Chromosome", ylab="# de novo variants in DDD 4k")
+
+```
+
+Variant 'consequence' given by highest VEP score:
+
+```{r consequence, echo=FALSE}
+par(mar=c(10,4,1,1) + 0.5)   # extra large bottom margin
+barplot(table(consequence)[table(consequence) != 0], cex.names=0.8, las=2, col="cyan", ylab="# de novo variants in DDD 4k")
+
+```
+
+Removing intronic variants for now (unlikely to be regulatory regions), but we will still match them against regulatory regions in the v3/v5 data.
+
+```{r consequence intronic removed, echo=FALSE}
+barplot(table(consequence)[(table(consequence) != 0) & (levels(consequence) != "intron_variant")], cex.names=0.9, las=2, col="cyan", ylab="# de novo variants in DDD 4k")
+
+```
+
+At this point we have all of the relevant data (most notably, the genomic location) for the _de novo_ regulatory mutations and need to load look-up table for mutation rate. We will construct this table from the data file as a vector.
+
+```{r lookup table}
+mut_rates <- read.table("forSanger_1KG_mutation_rate_table.txt", header=TRUE)
+
+p_single <- function(from, to){
+  p = mut_rates$mu_snp[c(mut_rates$from == from) & c(mut_rates$to == to)]
+  return(p)
+}
+
+p_all <- function(from){
+  p = mut_rates$mu_snp[c(mut_rates$from == from)]
+  return(sum(p))
+}
+```
+
+We can use the functions `p_single(from, to)` to find the probability under the null model of mutation from a certain trinucleotide to another trinucleotide (changing the middle base). Likewise `p_all(from)` gives the probability of mutation from one trinucleotide to all three other possibilities.
+
+Given a stretch of sequence, we want to scan across with `p_all`, adding the (assumed independent) poisson lambda terms together to arrive at a total probability distribution for mutation anywhere along the stretch of sequence. The function `p_sequence` returns this probability.
+
+```{r defining p_sequence}
+# may be able to do this better with rollapply, but looping for now
+p_sequence <- function(sequence){
+  p = 0
+  for (i in 1:nchar(sequence)){
+    p = p + p_all(substr(sequence, i, i+2))  }
+  return(p)
+  }
+
+```
+
+Given a sequence, we calculate the expected number of _de novo_ mutations and compare this to the observed number of _de novo_ mutations. Test for support or rejection of the null hypothesis uses the poisson exact test.
+
+```{r poisson exact test}
+
+test_null <- function(sequence, n_denovo){
+  # we are using a two sided poisson exact test
+  # n_denovo is number of denovo mutations in sequence
+  p_seq = p_sequence(sequence) # this is the poisson rate parameter we test against
+  pt = poisson.test(n_denovo, r=p_seq, alternative="two.sided")
+  
+  # return p.value from dataframe pt - may be useful to return conf.int as well later
+  return(pt$p.value)
+}
+
+```
+We can use do simple example with a hypothetical regulatory sequence and obvserved number of denovo mutations shown below.
+
+```{r simple example}
+seq = "CGTATACGA"
+n_denovo = 2
+```
+
+W we would find a p-value of `r test_null(seq, 2)` using the expression `test_null(seq, n_denovo)`. 
+
+

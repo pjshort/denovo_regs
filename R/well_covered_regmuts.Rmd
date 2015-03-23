@@ -1,0 +1,97 @@
+---
+title: "Well Covered Regulatory Mutations in DDD"
+author: "Patrick Short"
+date: "March 20, 2015"
+output: html_document
+---
+
+```{r libraries, echo=FALSE}
+library(quantsmooth)
+```
+
+First, load in the DDD 4k exome data, then the well-covered targeted regulatory regions (TRRs) courtesy of Dan King.
+
+```{r load data, include=FALSE}
+denovo_full <- read.table("../data/de_novos.ddd_4k.noncoding_included.txt", sep="\t", header=TRUE )
+```
+
+```{r non_coding variants, include=FALSE}
+denovo_noncoding = denovo_full[denovo_full$coding == "FALSE",]
+
+```{r well-covered targeted regulatory regions}
+well_covered_regions <- read.table("../data/DDD_TRRs.annotated.highcov.txt", sep="\t", header=TRUE)
+```
+
+We want to pull out all of the _de novo_ noncoding variants that are in well-covered regions.
+
+```{r well-covered denovo regulatory, include=FALSE}
+denovo_covered <- function(chr, pos){
+# get the list of positions corresp. to chromosome
+  chrom_coverage = well_covered_regions[well_covered_regions$chr == chr,]
+
+# check if position is in any well-covered interval
+  coverage_interval = chrom_coverage[(chrom_coverage$start < pos) & (chrom_coverage$stop > pos),]
+
+
+return(nrow(coverage_interval) > 0)  # TRUE if well covered
+}
+```
+
+```{r test coverage, include=FALSE}
+covered = mapply(denovo_covered, denovo_noncoding$chrom, denovo_noncoding$pos)
+denovo_noncoding_covered = denovo_noncoding[covered,]
+```
+
+We find `r sum(covered)` out of `r nrow(denovo_noncoding)` non-coding variants to be well-covered.
+
+Plotting the well-covered regulatory mutations to the chromosomes:
+
+```{r plot to chromosomes, echo=FALSE}
+# prepareGenomePlot example
+CHR <- denovo_noncoding_covered$chrom
+MapInfo <- denovo_noncoding_covered$pos
+# construct genomic positions
+chrompos<-prepareGenomePlot(data.frame(CHR, MapInfo), organism="hsa", sexChromosomes=TRUE)
+# Chrompos returns a matrix with the positions of the elements on the plot
+# You can use all kinds of base graphics functions to annotate the chromosomes
+points(chrompos[,2],chrompos[,1]+0.1,pch="x",col="red")
+
+
+```
+
+Plotting by VEP consequence and removing the intronic variants:
+
+```{r consequence intronic removed, echo=FALSE}
+consequence = denovo_noncoding_covered$consequence
+par(mar=c(10,4,1,1) + 0.5)   # extra large bottom margin
+barplot(table(consequence)[(table(consequence) != 0) & (levels(consequence) != "intron_variant")], cex.names=0.9, las=2, col="cyan", ylab="# well-covered de novo variants in DDD 4k")
+
+```
+
+TO DO: Cyan bars are the proportion of annotation source for _de novo_ mutations in the 4k exome data while purple bars are the annotation source for for the whole set of covered area.
+
+```{r annotation checking function, include=FALSE}
+# redoing some work here, but chose to do this way to separate the functions and not overly complicate the denovo_covered function which will be used frequently.
+
+regulatory_annotation <- function(chr, pos){
+# get the list of positions corresp. to chromosome
+  chrom_coverage = well_covered_regions[well_covered_regions$chr == chr,]
+
+# check if position is in any well-covered interval
+  coverage_interval = chrom_coverage[(chrom_coverage$start < pos) & (chrom_coverage$stop > pos),]
+
+
+return(coverage_interval$annotsummary)  # returns one of six levels
+}
+```
+
+```{r regulatory mutation source summary}
+regmut_source = mapply(regulatory_annotation, denovo_noncoding_covered$chrom, denovo_noncoding_covered$pos)
+
+counts_denovo = prop.table(table(regmut_source))
+counts_TRRs = prop.table(table(well_covered_regions$annotsummary))
+
+barplot(rbind(counts_denovo, counts_TRRs), beside=TRUE, col=c("cyan", "yellow"), legend = c("De Novo Mutations", "All Annotations - DDD 4k Exome"), ylab="Proportion", xlab = "Annotation Source")
+
+```
+

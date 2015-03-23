@@ -1,0 +1,108 @@
+---
+title: "De Novo Mutation Proximity to Genes"
+author: "Patrick Short"
+date: "March 20, 2015"
+output: html_document
+---
+
+Using the Gencode dataset restricted to protein-coding genes, we will search for the closest gene to each of the regulatory mutations. We will then check which of these genes are in the DDG2P dataset and if there is reason to look further at a possible enrichment of regulatory mutations around DDG2P genes.
+
+```{r load data, include=FALSE}
+denovo_full <- read.table("../data/de_novos.ddd_4k.noncoding_included.txt", sep="\t", header=TRUE )
+well_covered_regions <- read.table("../data/DDD_TRRs.annotated.highcov.txt", sep="\t", header=TRUE)
+all_gencode <- read.table("../data/all_gencode_genes_v19_+strand.txt", sep="\t", header=TRUE)
+ddg2p <- read.table("../data/DDG2P_freeze_with_gencode19_genomic_coordinates_20141118_fixed.txt", sep="\t", header=TRUE)
+
+#restricting gencode genes to ONLY protein-coding genes (removes pseudogenes, lincRNA, etc.)
+all_gencode <- all_gencode[all_gencode$gene_type == "protein_coding",]
+all_gencode$gene <- factor(all_gencode$gene)  # reset the factors (gene names)
+```
+
+```{r well-covered regulatory variants, include=FALSE}
+denovo_covered <- function(chr, pos){
+# get the list of positions corresp. to chromosome
+  chrom_coverage = well_covered_regions[well_covered_regions$chr == chr,]
+
+# check if position is in any well-covered interval
+  coverage_interval = chrom_coverage[(chrom_coverage$start < pos) & (chrom_coverage$stop > pos),]
+
+
+return(nrow(coverage_interval) > 0)  # TRUE if well covered
+}
+
+denovo_noncoding = denovo_full[denovo_full$coding == "FALSE",]
+covered_logical = mapply(denovo_covered, denovo_noncoding$chrom, denovo_noncoding$pos)
+denovo_noncoding_covered = denovo_noncoding[covered_logical,]
+```
+
+The DDD 4k exome data has `r nrow(denovo_noncoding)` non-coding _de novo_ mutations. `r nrow(denovo_noncoding_covered)` of these _de novo_ mutations are well-covered and lie in annotated regulatory regions. We can test these `r nrow(denovo_noncoding_covered)` for proximity to the nearest gencode gene, taking account for the strand and using the transcription start site for + strand and end site for - strand.
+
+```{r gene proximity start with strand}
+# using distance to tx start site as rule for closeness strand +/- included
+
+# define a new variable 'true start' for each gencode gene based on strand
+
+all_gencode$true_start <- all_gencode$start
+all_gencode$true_start[all_gencode$strand == "-"] <- all_gencode$stop[all_gencode$strand == "-"]  # take any start sites that have "-" strand and swap to the stop site. will have to negate this later on.
+
+closest_gene <- function(chr, pos){
+  # get reduce search to only genes on correct chromosome
+  gencode_chrom = all_gencode[all_gencode$chr == paste("chr", chr, sep=""),] # paste to add chr
+  
+# find closest start site accounting for strand
+  distance_to_start = gencode_chrom$true_start - pos
+  distance_to_start[gencode_chrom$strand == "-"] = (-1)*distance_to_start[gencode_chrom$strand == "-"]
+
+  # take the min nonzero distance (this is the closest gene downstream of noncoding variant)
+  closest_start = which.min(sapply(distance_to_start, function(z) if (z > 0) z else Inf))
+  closest_gene = gencode_chrom[closest_start,]
+  return(closest_gene$gene)
+}
+
+```
+
+```{r find closest genes non intronic}
+dn_non_intronic = denovo_noncoding_covered[denovo_noncoding_covered$consequence != "intron_variant",]
+regmut_closest_genes = mapply(closest_gene, dn_non_intronic$chrom, dn_non_intronic$pos)
+```
+
+```{r intronic variants}
+# we attribute the intergenic variants to the annotated gene from the variant calling pipeline
+dn_intronic = denovo_noncoding_covered[denovo_noncoding_covered$consequence == "intron_variant",]
+
+intronic_genes = dn_intronic$symbol
+```
+
+```{r check DDG2P overlap non-intronic}
+in_ddg2p_logical = regmut_closest_genes %in% ddg2p$gencode_gene_name
+in_ddg2p = sum(in_ddg2p_logical)
+ddg2p_denovos = dn_non_intronic[in_ddg2p_logical,]
+ddg2p_denovos$closest_gene = regmut_closest_genes[in_ddg2p_logical]
+ddg2p_genes_total = length(levels(ddg2p$gencode_gene_name))
+non_ddg2p_genes_total = length(levels(all_gencode$gene)) - length(levels(ddg2p$gencode_gene_name))
+```
+
+```{r check DDG2P overlap intronic}
+# I am not sure whether these should be considered in this analysis - as DDG2P genes were specified for the target-capture panel, it seems obvious that we would find an excess of intronic variants. However, these are intronic only as tagged by VEP, and because they are included in the annotated regulatory regions, we may choose to include them.
+
+intronic_logical = intronic_genes %in% ddg2p$gencode_gene_name
+intronic_ddg2p = sum(intronic_logical)
+ddg2p_intronic_denovos = dn_non_intronic[intronic_logical,]
+ddg2p_intronic_denovos$closest_gene = intronic_genes[intronic_logical]
+```
+
+As we will be testing intronic and non-intronic under the same model for _de novo_ variants against the null-hypothesis for _de novo_ mutation, we will combine intronic and non-intronic here for simplicity. Whether considered separately or together, the data implies that both intronic and non-intronic _de novo_ regulatory variants in DDD 4k patients are enriched near DDG2P genes when compared to the rest of the genome.
+
+```{r chi square testing}
+# as we will be testing these hypotheses again against a null mutation model, we will combine intronic and non-intronic here for simplicity.
+total_ddg2p_reg_muts = in_ddg2p + intronic_ddg2p
+total_ddg2p_genes = length(levels(ddg2p$gencode_gene_name))
+total_genes = length(levels(all_gencode$gene))
+contingency_table = rbind(c(total_ddg2p_reg_muts, nrow(denovo_noncoding_covered) - total_ddg2p_reg_muts), c(total_ddg2p_genes, total_genes - total_ddg2p_genes))
+csq = chisq.test(contingency_table)
+```
+
+Of the `r nrow(denovo_noncoding_covered)` well-covered _de novo_ regulatory mutations in the 4k exome, `r in_ddg2p + intronic_ddg2p` are closest to a DDG2P gene. This is in excess of expectation with chi-square test statistic `r csq$X_squared` and p-value `r csq$p_value`.
+
+The test used the `r length(levels(ddg2p$gencode_gene_name))` different genes present in the DDG2P set used in this analysis and `r length(levels(all_gencode$gene))` total genes in the gencode annotation used.
+
