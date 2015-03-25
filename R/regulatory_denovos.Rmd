@@ -1,0 +1,194 @@
+---
+title: "Enrichment of _de novo_ Regulatory Variants in DDD"
+author: "Patrick Short"
+date: "March 25, 2015"
+output: html_document
+---
+
+This analysis uses several different data sources:
+1. DDD 4k variant calls in non-coding regions of the genome.
+2. Catalogue of well-covered regulatory regions in the DDD 4k target-capture set (courtesy of Dan King)
+3. Trinucleotide Mutation rates derived from 1000 Genomes data (courtesy of Jeremey McRae)
+4. Gencode v19
+
+```{r load data, include=FALSE}
+denovo_full <- read.table("../data/de_novos.ddd_4k.noncoding_included.txt", sep="\t", header=TRUE )
+well_covered_regions <- read.table("../data/DDD_TRRs.annotated.highcov.sequence.txt", sep="\t", header=TRUE)
+all_gencode <- read.table("../data/all_gencode_genes_v19_+strand.txt", sep="\t", header=TRUE)
+ddg2p <- read.table("../data/DDG2P_freeze_with_gencode19_genomic_coordinates_20141118_fixed.txt", sep="\t", header=TRUE)
+
+#restricting gencode genes to ONLY protein-coding genes (removes pseudogenes, lincRNA, etc.)
+all_gencode <- all_gencode[all_gencode$gene_type == "protein_coding",]
+all_gencode$gene <- factor(all_gencode$gene)  # reset the factors (gene names)
+
+```
+
+To build a null-model for regulatory mutation burden by gene, we must first assign all of the well-covered regulatory regions in the target set to one of the Gencode v19 genes. This assignment process follows two simple rules:
+1. If the target region is contained entirely between the transcription start and stop site of a gene, it is assigned to that gene.
+2. If not fully contained by some gene, the region is assigned to the gene with the closest downstream transcription start site.
+
+```{r gene proximity, include=FALSE}
+# using distance to tx start site as rule for closeness strand +/- included
+# define a new variable 'true start' for each gencode gene based on strand
+# we must take any start sites that have "-" strand and swap to the stop site. will have to negate this later on.
+
+all_gencode$true_start <- all_gencode$start
+all_gencode$true_start[all_gencode$strand == "-"] <- all_gencode$stop[all_gencode$strand == "-"]
+
+all_gencode$true_stop <- all_gencode$stop
+all_gencode$true_stop[all_gencode$strand == "-"] <- all_gencode$start[all_gencode$strand == "-"]
+
+assign_to_gene <- function(chr, start, stop){
+  # reduce search to only genes on correct chromosome
+  gencode_chrom = all_gencode[all_gencode$chr == paste("chr", chr, sep=""),] # paste to add chr
+  
+  # find closest start site accounting for strand
+  distance_to_start = gencode_chrom$true_start - start
+  distance_to_start[gencode_chrom$strand == "-"] = (-1)*distance_to_start[gencode_chrom$strand == "-"]
+
+  distance_to_stop = gencode_chrom$true_stop - stop
+  distance_to_stop[gencode_chrom$strand == "-"] = (-1)*distance_to_stop[gencode_chrom$strand == "-"]
+
+  # check if start/stop are fully contained within an annotated gene. if so, assign this intronic region to that gene instead
+  intronic = gencode_chrom[distance_to_start < 0 & distance_to_stop > 0,]
+  if (nrow(intronic) == 1){
+      closest_gene = intronic$gene
+  } else {
+      closest_start = which.min(sapply(distance_to_start, function(z) if (z > 0) z else Inf))
+      closest_gene = gencode_chrom[closest_start, "gene"] }
+
+  return(closest_gene)
+  }
+
+```
+
+```{r assign regulatory regions, include=FALSE}
+reg_region_closest_gene = factor(mapply(assign_to_gene, well_covered_regions$chr, well_covered_regions$start, well_covered_regions$stop)) # returns a vector of gene names, one for each well-covered regulatory region
+
+well_covered_regions$closest_gene = reg_region_closest_gene
+
+```
+
+The data contains `r nrow(well_covered_regions)` well-covered regulatory regions. These regions have been assigned to `r nlevels(well_covered_regions$closest_gene)` different genes. The number of regulatory regions per gene is plotted below:
+
+```{r regulatory regions per gene, echo=FALSE}
+h = hist(table(well_covered_regions$closest_gene), xlab="Regulatory Regions per Gene", main="Most Genes Are Assigned 1-5 Regulatory Regions")
+axis(side=1, at=seq(min(h$breaks), max(h$breaks), 5), labels=seq(min(h$breaks),max(h$breaks),5))
+
+```
+
+```{r coverage checking function, include=FALSE}
+denovo_covered <- function(chr, pos){
+# get the list of positions corresp. to chromosome
+  chrom_coverage = well_covered_regions[well_covered_regions$chr == chr,]
+
+# check if position is in any well-covered interval
+  coverage_interval = chrom_coverage[(chrom_coverage$start < pos) & (chrom_coverage$stop > pos),]
+
+return(nrow(coverage_interval) > 0)  # TRUE if well covered
+}
+
+covered_gene <- function(chr, pos){
+  chrom_coverage = well_covered_regions[well_covered_regions$chr == chr,]
+
+# check if position is in any well-covered interval
+  coverage_interval = chrom_coverage[(chrom_coverage$start < pos) & (chrom_coverage$stop > pos),]
+  
+  return(coverage_interval[1, "closest_gene"])
+}
+```
+
+```{r check coverage and closest gene DDD denovo noncoding, include=FALSE}
+UNDIAGNOSED = FALSE  # whether to consider only undiagnosed probands
+
+diagnosed_probands <- read.table("../data/ddd_likely_diagnosed.txt", sep="\t", header=TRUE)
+undiagnosed_probands <- levels(factor(denovo_full$person_stable_id[!(denovo_full$person_stable_id %in% diagnosed_probands$person_id)]))
+number_undiagnosed = length(undiagnosed_probands)
+
+denovo_noncoding = denovo_full[denovo_full$coding == "FALSE",]
+
+if (UNDIAGNOSED == TRUE){
+  denovo_noncoding = denovo_noncoding[denovo_noncoding$person_stable_id %in% undiagnosed_probands,]
+}
+
+covered = mapply(denovo_covered, denovo_noncoding$chrom, denovo_noncoding$pos)
+
+# will treat only well-covered regulatory denovos as observed
+observed_regulatory = denovo_noncoding[covered,]
+observed_regulatory$closest_gene = mapply(covered_gene, observed_regulatory$chr, observed_regulatory$pos)
+
+# add yes/no if closest gene is in ddg2p
+observed_regulatory$in_ddg2p = observed_regulatory$closest_gene %in% ddg2p$gencode_gene_name
+
+```
+
+The DDD 4k exome data contains `r nrow(denovo_noncoding)` noncoding _de novo_ variants in `r length(unique(observed_regulatory$person_stable_id))` probands. As we have already mapped the `r nrow(well_covered_regions)` well-covered regulatory regions to the closest gene, we can filter the DDD 4k exome noncoding variants for those that lie in the well-covered regulatory regions and assign these to the closest gene in the same manner.
+
+There are `r nrow(observed_regulatory)` well-covered regulatory variants. For `r sum(observed_regulatory$in_ddg2p)` of these `r nrow(observed_regulatory)` variants, the closest gene is in the DDG2P freeze used in this analysis.
+
+For all `r length(unique(observed_regulatory$closest_genes))` genes covered by the well-covered regulatory mutations, we will apply a null-model of trinucleotide mutation rate, derived from 1000 genomes data to test if the number of _de novo_ mutations found in regulatory regions assigned to that gene is in excess of the amount expected. The null model provides a mutation rate for each gene based on the specific sequence context for all of the regulatory regions assigned to each gene. We can test the number of observed _de novo_ mutations against the null model.
+
+```{r defining mutation null model, include=FALSE}
+mut_rates <- read.table("../data/forSanger_1KG_mutation_rate_table.txt", header=TRUE)
+
+# mutation probability for single trinucleotide to any other (changing middle base)
+p_all <- function(from){
+  p = mut_rates$mu_snp[c(mut_rates$from == from)]
+  return(sum(p))
+}
+
+# mutation probability over a whole sequence (applying p_all in sliding window)
+p_sequence <- function(sequence){
+  sequence = as.character(sequence)
+  p = 0
+  for (i in 1:nchar(sequence)){
+    p = p + p_all(substr(sequence, i, i+2))  }
+  return(p)
+  }
+
+# mut probaiblity over all reg-regions assoc. with a gene (applying p_sequence for all seq)
+p_gene <- function(gene_name){
+  gene_name = as.character(gene_name)
+  reg_regions = well_covered_regions[well_covered_regions$closest_gene == gene_name,]
+  combined_lambda = sum(mapply(p_sequence, reg_regions$seq))
+  
+  return(combined_lambda)
+}
+```
+
+```{r generate gene-wide lambda values, include=FALSE}
+
+#create a dataframe with gene name, in_ddg2p, observed mutations, lambda value
+regmut_genes = unique(observed_regulatory$closest_gene)
+ddg2p_gene_bool = regmut_genes %in% ddg2p$gencode_gene_name
+observed_dn_count = as.numeric(lapply(regmut_genes, function(x) nrow(observed_regulatory[observed_regulatory$closest_gene == x,])))
+regulatory_regions = as.numeric(lapply(regmut_genes, function(x) nrow(well_covered_regions[well_covered_regions$closest_gene == x,])))
+gene_lambdas = as.numeric(lapply(regmut_genes, p_gene))
+#gene_lambdas = runif(length(regmut_genes))
+if (UNDIAGNOSED == TRUE){
+  num_probands = number_undiagnosed
+} else {
+  num_probands = nlevels(factor(denovo_full$person_stable_id))
+
+}
+
+genes <- data.frame("name" = regmut_genes, "regulatory_regions" = regulatory_regions , "in_ddg2p" = ddg2p_gene_bool , "observed_regulatory_denovos" = observed_dn_count, "p_null" = gene_lambdas*num_probands)
+```
+
+```{r test genes for enrichment of denovos, include=FALSE}
+num_tests = nlevels(well_covered_regions$closest_gene)
+fdr_threshold = 0.10
+
+genes$p_regulatory = dpois(genes$observed_regulatory_denovos, genes$p_null)
+genes$fdr_regulatory = p.adjust(genes$p_regulatory, method="BH", n=num_tests)
+
+sig = which(genes$fdr_regulatory < fdr_threshold)
+```
+
+Controlling the p-values generated here for a false discovery rate at the alpha = 0.05 level (1 in 20 'discoveries' will be a false positive) leaves several genes in the table below that we have strong reason to follow up on:
+
+```{r display significant result table, echo=FALSE}
+library(knitr)
+kable(genes[sig,])
+```
+
